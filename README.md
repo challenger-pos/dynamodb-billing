@@ -32,8 +32,18 @@ dynamodb-billing/
 │   │   ├── variables.tf
 │   │   ├── terraform.tfvars
 │   │   └── outputs.tf
-│   ├── homologation/     # TODO: Environment homologation
-│   └── production/       # TODO: Environment production
+│   ├── homologation/     # Environment homologation
+│   │   ├── backend.tf
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── terraform.tfvars
+│   │   └── outputs.tf
+│   └── production/       # Environment production
+│       ├── backend.tf
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── terraform.tfvars
+│       └── outputs.tf
 └── README.md
 ```
 
@@ -90,13 +100,49 @@ terraform plan -var-file=terraform.tfvars
 terraform apply -var-file=terraform.tfvars
 ```
 
+### Deploy - Environment Homologation
+
+```bash
+cd envs/homologation
+
+# Inicializar Terraform
+terraform init
+
+# Planejar mudanças
+terraform plan -var-file=terraform.tfvars
+
+# Aplicar
+terraform apply -var-file=terraform.tfvars
+```
+
+### Deploy - Environment Production
+
+```bash
+cd envs/production
+
+# Inicializar Terraform
+terraform init
+
+# Planejar mudanças
+terraform plan -var-file=terraform.tfvars
+
+# Aplicar
+terraform apply -var-file=terraform.tfvars
+```
+
 ### Outputs
 
 Após o apply, os seguintes outputs estarão disponíveis:
 
 ```bash
+# Dev
 terraform output table_name  # challengeone-billing-dev
-terraform output table_arn   # arn:aws:dynamodb:us-east-2:...
+
+# Homologation
+terraform output table_name  # challengeone-billing-homologation
+
+# Production
+terraform output table_name  # challengeone-billing-production
 ```
 
 ## ⚙️ Variáveis de Configuração
@@ -112,19 +158,49 @@ terraform output table_arn   # arn:aws:dynamodb:us-east-2:...
 **PROVISIONED**:
 - Capacidade fixa com auto-scaling
 - Custos mais previsíveis
-- Melhor para tráfego constante
+# Dev
+data "terraform_remote_state" "dynamodb_billing" {
+  backend = "s3"
+  config = {
+    bucket = "tf-state-challenge-bucket"
+    key    = "v4/dynamodb-billing/dev/terraform.tfstate"
+    region = "us-east-2"
+  }
+}
 
-```hcl
-# terraform.tfvars
-billing_mode = "PAY_PER_REQUEST"  # ou "PROVISIONED"
+# Homologation
+data "terraform_remote_state" "dynamodb_billing" {
+  backend = "s3"
+  config = {
+    bucket = "tf-state-challenge-bucket"
+    key    = "v4/dynamodb-billing/homologation/terraform.tfstate"
+    region = "us-east-2"
+  }
+}
+
+# Production
+data "terraform_remote_state" "dynamodb_billing" {
+  backend = "s3"
+  config = {
+    bucket = "tf-state-challenge-bucket"
+    key    = "v4/dynamodb-billing/production/terraform.tfstate"
+    region = "us-east-2"
+  }
+}
 ```
 
-### Features Opcionais
+2. **Environment Variables** (ConfigMap):
+```yaml
+# Dev
+AWS_DYNAMODB_TABLE_NAME: challengeone-billing-dev
+AWS_REGION: us-east-2
 
-```hcl
-# Point-in-time Recovery (backup contínuo)
-enable_point_in_time_recovery = true
+# Homologation
+AWS_DYNAMODB_TABLE_NAME: challengeone-billing-homologation
+AWS_REGION: us-east-2
 
+# Production
+AWS_DYNAMODB_TABLE_NAME: challengeone-billing-production
 # DynamoDB Streams (CDC para Lambda/EventBridge)
 enable_streams = true
 
@@ -162,13 +238,36 @@ data "terraform_remote_state" "dynamodb_billing" {
 ```yaml
 AWS_DYNAMODB_TABLE_NAME: challengeone-billing-dev
 AWS_REGION: us-east-2
+```� Free Tier Configuration
+
+Todos os ambientes estão configurados para manter custos baixos (projeto de estudos com AWS Free Tier):
+
+```hcl
+billing_mode = "PAY_PER_REQUEST"  # Free tier: 25 WCU/RCU grátis/mês
+enable_point_in_time_recovery = false  # Economia: desabilitado
+enable_streams = false  # Economia: desabilitado  
+enable_ttl = false  # Sem custo extra
+kms_key_arn = null  # USA AWS managed key (sem custo)
 ```
 
-3. **Spring Boot Application**:
-```java
-@DynamoDbTable(tableName = "${aws.dynamodb.table-name}")
-public class Payment {
-    @DynamoDbPartitionKey
+**Capacidade Free Tier DynamoDB:**
+- 25 GB de armazenamento
+- 25 unidades de leitura/s
+- 25 unidades de escrita/s
+- Suficiente para tráfego baixo de estudos
+
+## 📝 Ambientes Disponíveis
+
+| Ambiente | Table Name | State Path | Status |
+|----------|-----------|------------|--------|
+| Dev | `challengeone-billing-dev` | `v4/dynamodb-billing/dev/` | ✅ Pronto |
+| Homologation | `challengeone-billing-homologation` | `v4/dynamodb-billing/homologation/` | ✅ Pronto |
+| Production | `challengeone-billing-production` | `v4/dynamodb-billing/production/` | ✅ Pronto |
+
+---
+
+**Maintainer**: Grupo 19  
+**Last Updated**: 2026-02-18
     private String paymentId;
     
     @DynamoDbSortKey
@@ -194,12 +293,6 @@ public class Payment {
 
 ## 📝 To-Do
 
-- [ ] Criar environment homologation
-- [ ] Criar environment production com auto-scaling
-- [ ] Configurar KMS custom key para encryption
-- [ ] Implementar DynamoDB Streams para auditoria
-- [ ] Configurar Lambda para backup para S3
-- [ ] Setup de alarmes SNS para CloudWatch
 
 ---
 
