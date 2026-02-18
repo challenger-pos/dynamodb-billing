@@ -1,0 +1,367 @@
+name: CI/CD Pipeline - DynamoDB Billing Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+      - feature/cicd
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy to environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - homologation
+          - production
+          - all
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: '1.8.0'
+
+jobs:
+  # ============================================================================
+  # VALIDATE TERRAFORM
+  # ============================================================================
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Validate Dev Environment
+        run: |
+          cd envs/dev
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate Homologation Environment
+        run: |
+          cd envs/homologation
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate Production Environment
+        run: |
+          cd envs/production
+          terraform init -backend=false
+          terraform validate
+
+  # ============================================================================
+  # SECURITY SCAN
+  # ============================================================================
+  security-scan:
+    name: Security Scan (Checkov)
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          skip_check: CKV_AWS_119,CKV_AWS_28  # Skip DynamoDB PITR and encryption (free tier)
+        continue-on-error: true
+
+      - name: Upload Checkov results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+        continue-on-error: true
+
+  # ============================================================================
+  # DEPLOY TO DEVELOPMENT
+  # ============================================================================
+  deploy-dev:
+    name: Deploy DynamoDB - Development
+    runs-on: ubuntu-latest
+    needs: [ validate, security-scan ]
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'dev' || github.event.inputs.environment == 'all'))
+    environment:
+      name: dev
+      url: https://console.aws.amazon.com/dynamodbv2/home?region=us-east-2#table?name=challengeone-billing-dev
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-dynamodb-dev
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init - Dev
+        run: |
+          cd envs/dev
+          terraform init
+
+      - name: Terraform Plan - Dev
+        run: |
+          cd envs/dev
+          terraform plan -var-file=terraform.tfvars -out=tfplan
+
+      - name: Terraform Apply - Dev
+        run: |
+          cd envs/dev
+          terraform apply -auto-approve tfplan
+
+      - name: Get DynamoDB Table Info
+        id: dynamodb-info
+        run: |
+          cd envs/dev
+          TABLE_NAME=$(terraform output -raw table_name)
+          TABLE_ARN=$(terraform output -raw table_arn)
+          echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+          echo "table_arn=$TABLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Verify DynamoDB Table
+        run: |
+          aws dynamodb describe-table \
+            --table-name ${{ steps.dynamodb-info.outputs.table_name }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Display Deployment Info
+        run: |
+          echo "============================================"
+          echo "✅ DynamoDB Table Deployed - DEV"
+          echo "============================================"
+          echo "Table Name: ${{ steps.dynamodb-info.outputs.table_name }}"
+          echo "Table ARN: ${{ steps.dynamodb-info.outputs.table_arn }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "============================================"
+
+  # ============================================================================
+  # DEPLOY TO HOMOLOGATION
+  # ============================================================================
+  deploy-homolog:
+    name: Deploy DynamoDB - Homologation
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'homologation' || github.event.inputs.environment == 'all'))
+    environment:
+      name: homologation
+      url: https://console.aws.amazon.com/dynamodbv2/home?region=us-east-2#table?name=challengeone-billing-homologation
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-dynamodb-homolog
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init - Homologation
+        run: |
+          cd envs/homologation
+          terraform init
+
+      - name: Terraform Plan - Homologation
+        run: |
+          cd envs/homologation
+          terraform plan -var-file=terraform.tfvars -out=tfplan
+
+      - name: Terraform Apply - Homologation
+        run: |
+          cd envs/homologation
+          terraform apply -auto-approve tfplan
+
+      - name: Get DynamoDB Table Info
+        id: dynamodb-info
+        run: |
+          cd envs/homologation
+          TABLE_NAME=$(terraform output -raw table_name)
+          TABLE_ARN=$(terraform output -raw table_arn)
+          echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+          echo "table_arn=$TABLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Verify DynamoDB Table
+        run: |
+          aws dynamodb describe-table \
+            --table-name ${{ steps.dynamodb-info.outputs.table_name }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Display Deployment Info
+        run: |
+          echo "============================================"
+          echo "✅ DynamoDB Table Deployed - HOMOLOGATION"
+          echo "============================================"
+          echo "Table Name: ${{ steps.dynamodb-info.outputs.table_name }}"
+          echo "Table ARN: ${{ steps.dynamodb-info.outputs.table_arn }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "============================================"
+
+  # ============================================================================
+  # DEPLOY TO PRODUCTION (Manual Approval)
+  # ============================================================================
+  deploy-prod:
+    name: Deploy DynamoDB - Production
+    runs-on: ubuntu-latest
+    needs: deploy-homolog
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'production' || github.event.inputs.environment == 'all'))
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/dynamodbv2/home?region=us-east-2#table?name=challengeone-billing-production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-dynamodb-prod
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init - Production
+        run: |
+          cd envs/production
+          terraform init
+
+      - name: Terraform Plan - Production
+        run: |
+          cd envs/production
+          terraform plan -var-file=terraform.tfvars -out=tfplan
+
+      - name: Terraform Apply - Production
+        run: |
+          cd envs/production
+          terraform apply -auto-approve tfplan
+
+      - name: Get DynamoDB Table Info
+        id: dynamodb-info
+        run: |
+          cd envs/production
+          TABLE_NAME=$(terraform output -raw table_name)
+          TABLE_ARN=$(terraform output -raw table_arn)
+          echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+          echo "table_arn=$TABLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Verify DynamoDB Table
+        run: |
+          aws dynamodb describe-table \
+            --table-name ${{ steps.dynamodb-info.outputs.table_name }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Display Deployment Info
+        run: |
+          echo "============================================"
+          echo "🚀 DynamoDB Table Deployed - PRODUCTION"
+          echo "============================================"
+          echo "Table Name: ${{ steps.dynamodb-info.outputs.table_name }}"
+          echo "Table ARN: ${{ steps.dynamodb-info.outputs.table_arn }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "============================================"
+
+      - name: Tag Production Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          TAG="dynamodb-v$(date +%Y%m%d-%H%M%S)"
+          git tag -a "$TAG" -m "Production deployment: DynamoDB infrastructure"
+          git push origin "$TAG"
+        continue-on-error: true
+
+  # ============================================================================
+  # NOTIFICATION
+  # ============================================================================
+  notify:
+    name: Pipeline Notification
+    runs-on: ubuntu-latest
+    needs: [ validate, security-scan, deploy-dev ]
+    if: always()
+    permissions:
+      contents: read
+
+    steps:
+      - name: Determine pipeline status
+        run: |
+          if [ "${{ needs.validate.result }}" == "failure" ] || \
+             [ "${{ needs.security-scan.result }}" == "failure" ] || \
+             [ "${{ needs.deploy-dev.result }}" == "failure" ]; then
+            echo "PIPELINE_STATUS=❌ FAILED" >> $GITHUB_ENV
+            exit 1
+          else
+            echo "PIPELINE_STATUS=✅ SUCCESS" >> $GITHUB_ENV
+          fi
+
+      - name: Print summary
+        run: |
+          echo "=========================================="
+          echo "DynamoDB Billing Infrastructure Pipeline"
+          echo "${{ env.PIPELINE_STATUS }}"
+          echo "=========================================="
+          echo "Validate: ${{ needs.validate.result }}"
+          echo "Security: ${{ needs.security-scan.result }}"
+          echo "Deploy Dev: ${{ needs.deploy-dev.result }}"
+          echo "=========================================="
